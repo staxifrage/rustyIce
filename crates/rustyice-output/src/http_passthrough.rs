@@ -12,13 +12,24 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 pub struct HttpPassthroughOutput {
-    /// Bytes between ICY metadata frames. Standard value: 8192.
+    /// Bytes between ICY metadata frames. Standard value: 16000 (advertised
+    /// to clients as `icy-metaint`; configurable via `[limits].icy_metaint`).
     pub icy_metaint: usize,
 }
 
 impl Default for HttpPassthroughOutput {
     fn default() -> Self {
-        Self { icy_metaint: 8192 }
+        Self { icy_metaint: 16_000 }
+    }
+}
+
+impl HttpPassthroughOutput {
+    /// Build an output with the metaint from `[limits].icy_metaint`. A value
+    /// of 0 falls back to the Icecast-compatible default (16000) so the
+    /// in-band framing can never divide by zero.
+    #[must_use]
+    pub fn with_metaint(metaint: u32) -> Self {
+        Self { icy_metaint: if metaint == 0 { 16_000 } else { metaint as usize } }
     }
 }
 
@@ -35,12 +46,19 @@ impl OutputProtocol for HttpPassthroughOutput {
         mount_info: Arc<MountInfo>,
         current_title: Arc<arc_swap::ArcSwap<Option<String>>>,
         source_overlay: Arc<arc_swap::ArcSwap<Option<SourceOverlay>>>,
-        icy_requested: bool,
+        has_icy_metadata: bool,
+        last_meta_payload: &mut Option<Vec<u8>>,
         cancellation: CancellationToken,
     ) -> Result<ListenerStats, OutputError> {
         let start = Instant::now();
         let mut bytes_sent: u64 = 0;
-        let mut bytes_since_meta: usize = 0;
+        // Connection-specific ICY state: audio bytes written since the last
+        // in-band metadata block, and the metadata payload last injected on
+        // *this* connection. Listeners join at different moments, so the
+        // counter must live per writer loop — never on the shared bus.
+        // Per spec, `bytes_sent_since_meta` counts only audio bytes; the
+        // metadata frames themselves are tracked in `bytes_sent` (wire total).
+        let mut bytes_sent_since_meta: usize = 0;
         let mut disconnect_reason = DisconnectReason::SourceEnded;
 
         loop {
@@ -57,7 +75,7 @@ impl OutputProtocol for HttpPassthroughOutput {
                     };
                     let data = &enc.data;
 
-                    if icy_requested {
+                    if has_icy_metadata {
                         write_with_icy(
                             &mut writer,
                             data,
@@ -65,7 +83,8 @@ impl OutputProtocol for HttpPassthroughOutput {
                             &current_title,
                             &source_overlay,
                             self.icy_metaint,
-                            &mut bytes_since_meta,
+                            &mut bytes_sent_since_meta,
+                            last_meta_payload,
                             &mut bytes_sent,
                         )
                         .await?;
@@ -94,51 +113,82 @@ async fn write_with_icy(
     current_title: &Arc<arc_swap::ArcSwap<Option<String>>>,
     source_overlay: &Arc<arc_swap::ArcSwap<Option<SourceOverlay>>>,
     metaint: usize,
-    bytes_since_meta: &mut usize,
+    bytes_sent_since_meta: &mut usize,
+    last_meta_payload: &mut Option<Vec<u8>>,
     bytes_sent: &mut u64,
 ) -> Result<(), OutputError> {
     let mut offset = 0;
     while offset < data.len() {
-        let space = metaint - *bytes_since_meta;
+        // Write audio only up to the next icy-metaint boundary; if this chunk
+        // crosses it, split the write and pause the audio for the meta block.
+        let space = metaint - *bytes_sent_since_meta;
         let chunk_end = (offset + space).min(data.len());
         let chunk = &data[offset..chunk_end];
         writer.write_all(chunk).await.map_err(OutputError::Io)?;
         *bytes_sent += chunk.len() as u64;
-        *bytes_since_meta += chunk.len();
+        *bytes_sent_since_meta += chunk.len();
         offset = chunk_end;
 
-        if *bytes_since_meta >= metaint {
-            let frame = build_icy_frame(info, current_title, source_overlay);
+        if *bytes_sent_since_meta >= metaint {
+            let frame = build_icy_frame(info, current_title, source_overlay, last_meta_payload);
             writer.write_all(&frame).await.map_err(OutputError::Io)?;
-            *bytes_since_meta = 0;
+            // Meta frames don't count toward the audio interval — the
+            // listener's parser resyncs on the length byte and expects
+            // exactly `metaint` audio bytes before the next block.
+            *bytes_sent_since_meta = 0;
         }
     }
     Ok(())
+}
+
+/// Resolve the effective now-playing title for this mount: the live/AutoDJ/
+/// admin-set title wins, then the source-supplied name overlay, then the
+/// configured mount name.
+fn effective_title(
+    info: &MountInfo,
+    current_title: &Arc<arc_swap::ArcSwap<Option<String>>>,
+    source_overlay: &Arc<arc_swap::ArcSwap<Option<SourceOverlay>>>,
+) -> String {
+    let title_snap = current_title.load_full();
+    let overlay_snap = source_overlay.load_full();
+    let overlay_ref = overlay_snap.as_ref().as_ref();
+    title_snap
+        .as_deref()
+        .or_else(|| overlay_ref.and_then(|o| o.name.as_deref()))
+        .or(info.metadata.name.as_deref())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn build_icy_frame(
     info: &MountInfo,
     current_title: &Arc<arc_swap::ArcSwap<Option<String>>>,
     source_overlay: &Arc<arc_swap::ArcSwap<Option<SourceOverlay>>>,
+    last_meta_payload: &mut Option<Vec<u8>>,
 ) -> Vec<u8> {
-    let title_snap = current_title.load_full();
     let overlay_snap = source_overlay.load_full();
     let overlay_ref = overlay_snap.as_ref().as_ref();
 
-    let title = title_snap
-        .as_deref()
-        .or_else(|| overlay_ref.and_then(|o| o.name.as_deref()))
-        .or(info.metadata.name.as_deref())
-        .unwrap_or("");
+    let title = effective_title(info, current_title, source_overlay);
     let url = overlay_ref
         .and_then(|o| o.url.as_deref())
         .or(info.metadata.url.as_deref())
         .unwrap_or("");
-    if title.is_empty() && url.is_empty() {
+    let meta_str = format!("StreamTitle='{title}';StreamUrl='{url}';");
+    let payload = meta_str.into_bytes();
+
+    // Per-connection change detection: if the payload is identical to what
+    // was last injected on this connection, send a zero-length block so the
+    // player keeps its current "Now Playing" display without re-parsing.
+    if last_meta_payload.as_deref() == Some(payload.as_slice()) {
         return vec![0x00];
     }
-    let meta_str = format!("StreamTitle='{title}';StreamUrl='{url}';");
-    let raw = meta_str.as_bytes();
+    if payload.is_empty() {
+        return vec![0x00];
+    }
+    *last_meta_payload = Some(payload.clone());
+
+    let raw = payload.as_slice();
     let blocks = raw.len().div_ceil(16);
     let padded = blocks * 16;
     let mut frame = Vec::with_capacity(1 + padded);
@@ -177,6 +227,11 @@ mod tests {
         Arc::new(arc_swap::ArcSwap::from_pointee(None))
     }
 
+    /// Per-connection "last injected payload" tracker (starts empty).
+    fn no_last_meta() -> Option<Vec<u8>> {
+        None
+    }
+
     fn make_mount_info(name: Option<&str>) -> Arc<MountInfo> {
         Arc::new(MountInfo {
             path: "/stream".to_string(),
@@ -201,7 +256,7 @@ mod tests {
             Box::pin(stream::iter(vec![make_packet(payload)]));
 
         let stats = HttpPassthroughOutput::default()
-            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), false, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), &mut no_last_meta(), false, CancellationToken::new())
             .await
             .unwrap();
 
@@ -220,7 +275,7 @@ mod tests {
             Box::pin(stream::iter(vec![make_packet(&payload)]));
 
         HttpPassthroughOutput { icy_metaint: 8 }
-            .run(writer, subscription, make_mount_info(Some("Test")), empty_title(), empty_overlay(), true, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(Some("Test")), empty_title(), empty_overlay(), &mut no_last_meta(), true, CancellationToken::new())
             .await
             .unwrap();
 
@@ -241,7 +296,7 @@ mod tests {
             Box::pin(stream::iter(vec![make_packet(&[0u8; 4])]));
 
         HttpPassthroughOutput { icy_metaint: 4 }
-            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), true, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), &mut no_last_meta(), true, CancellationToken::new())
             .await
             .unwrap();
 
@@ -261,7 +316,7 @@ mod tests {
         let token_clone = token.clone();
         let handle = tokio::spawn(async move {
             HttpPassthroughOutput::default()
-                .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), false, token_clone)
+                .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), &mut no_last_meta(), false, token_clone)
                 .await
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -299,7 +354,7 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(Some("Artist - Song".to_string())));
 
         HttpPassthroughOutput { icy_metaint: 8 }
-            .run(writer, subscription, make_mount_info(Some("Mount Name")), title, empty_overlay(), true, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(Some("Mount Name")), title, empty_overlay(), &mut no_last_meta(), true, CancellationToken::new())
             .await
             .unwrap();
 
@@ -321,7 +376,7 @@ mod tests {
             Box::pin(stream::iter(vec![make_packet(&payload)]));
 
         HttpPassthroughOutput { icy_metaint: 8 }
-            .run(writer, subscription, make_mount_info(Some("Mount Name")), empty_title(), empty_overlay(), true, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(Some("Mount Name")), empty_title(), empty_overlay(), &mut no_last_meta(), true, CancellationToken::new())
             .await
             .unwrap();
 
@@ -340,7 +395,7 @@ mod tests {
             Box::pin(stream::iter(vec![make_packet(&[0u8; 4])]));
 
         HttpPassthroughOutput { icy_metaint: 4 }
-            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), true, CancellationToken::new())
+            .run(writer, subscription, make_mount_info(None), empty_title(), empty_overlay(), &mut no_last_meta(), true, CancellationToken::new())
             .await
             .unwrap();
 
@@ -371,7 +426,7 @@ mod tests {
             url: Some("https://overlay".to_string()),
             ..Default::default()
         })));
-        let frame = build_icy_frame(&info, &current_title, &overlay);
+        let frame = build_icy_frame(&info, &current_title, &overlay, &mut no_last_meta());
         let s = String::from_utf8_lossy(&frame[1..]);
         assert!(
             s.contains("StreamTitle='From Source';"),
@@ -398,7 +453,7 @@ mod tests {
             name: Some("From Source".to_string()),
             ..Default::default()
         })));
-        let frame = build_icy_frame(&info, &current_title, &overlay);
+        let frame = build_icy_frame(&info, &current_title, &overlay, &mut no_last_meta());
         let s = String::from_utf8_lossy(&frame[1..]);
         assert!(
             s.contains("StreamTitle='Artist - Song';"),
@@ -423,7 +478,7 @@ mod tests {
         let current_title = Arc::new(ArcSwap::from_pointee(None));
         // Overlay present but no name/url fields set.
         let overlay = Arc::new(ArcSwap::from_pointee(Some(SourceOverlay::default())));
-        let frame = build_icy_frame(&info, &current_title, &overlay);
+        let frame = build_icy_frame(&info, &current_title, &overlay, &mut no_last_meta());
         let s = String::from_utf8_lossy(&frame[1..]);
         assert!(s.contains("StreamTitle='Cfg Name';"), "got: {s:?}");
         assert!(s.contains("StreamUrl='https://cfg';"), "got: {s:?}");

@@ -78,6 +78,10 @@ fn default_burst_size() -> u32 {
     65_536
 }
 
+fn default_icy_metaint() -> u32 {
+    16_000
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub stream_bind: SocketAddr,
@@ -153,6 +157,14 @@ pub struct LimitsConfig {
     /// (default 65536). Set to 0 to disable.
     #[serde(default = "default_burst_size")]
     pub burst_size: u32,
+    /// ICY in-band metadata interval: number of audio bytes between metadata
+    /// blocks injected into MP3 listener streams (advertised as the
+    /// `icy-metaint` response header to clients that send `Icy-MetaData: 1`).
+    /// Icecast-compatible (default 16000). Applies to MP3 output only —
+    /// Vorbis streams carry metadata in native Vorbis comment headers and
+    /// never advertise `icy-metaint`.
+    #[serde(default = "default_icy_metaint")]
+    pub icy_metaint: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -518,6 +530,28 @@ bitrate_kbps = 96
     fn burst_size_defaults_to_65536_when_absent() {
         let cfg: Config = toml::from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(cfg.limits.burst_size, 65_536);
+    }
+
+    #[test]
+    fn icy_metaint_defaults_to_16000_when_absent() {
+        let cfg: Config = toml::from_str(MINIMAL_CONFIG).unwrap();
+        assert_eq!(cfg.limits.icy_metaint, 16_000);
+    }
+
+    #[test]
+    fn icy_metaint_is_configurable() {
+        let src = format!(
+            r#"{BASE_CONFIG}
+[limits]
+max_listeners_global  = 500
+ring_size             = 64
+slow_listener_grace_s = 2
+burst_size            = 65536
+icy_metaint           = 8192
+"#
+        );
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(cfg.limits.icy_metaint, 8_192);
     }
 
     #[test]
