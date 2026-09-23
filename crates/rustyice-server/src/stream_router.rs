@@ -73,12 +73,17 @@ async fn listener_handler(
     let content_type = content_type_for(&output_codec);
     // ICY interleaved metadata is an MP3-only convention.  Vorbis streams
     // carry metadata in-stream as Vorbis comments, and injecting an ICY
-    // byte every 8192 bytes would corrupt Ogg page framing.
-    let icy_requested = output_codec == CodecId::MP3
+    // byte block into the Ogg stream would corrupt page framing — so we
+    // never honour (or advertise) it for Vorbis output.
+    let has_icy_metadata = output_codec == CodecId::MP3
         && headers
             .get("icy-metadata")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim() == "1");
+    // Bytes of audio between in-band metadata blocks; advertised to the
+    // listener as `icy-metaint` and used by the output writer's per-
+    // connection injection counter. Configurable via [limits].icy_metaint.
+    let icy_metaint = cfg.limits.icy_metaint.max(1);
     let header_bytes_snap = mount.header_bytes.load_full();
 
     let current_title = mount.current_title.clone();
@@ -127,7 +132,7 @@ async fn listener_handler(
             }
         }
         match output
-            .run(writer, subscription, mount_info, current_title, source_overlay, icy_requested, cancel_clone)
+            .run(writer, subscription, mount_info, current_title, source_overlay, has_icy_metadata, cancel_clone)
             .await
         {
             Ok(listener_stats) => {
@@ -192,8 +197,8 @@ async fn listener_handler(
         builder = builder.header("icy-br", b.to_string());
     }
 
-    if icy_requested {
-        builder = builder.header("icy-metaint", "8192");
+    if has_icy_metadata {
+        builder = builder.header("icy-metaint", icy_metaint.to_string());
     }
 
     builder

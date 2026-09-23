@@ -98,6 +98,11 @@ pub trait OutputProtocol: Send + Sync + 'static {
 
     /// Stream packets to the listener until it disconnects, is kicked,
     /// or `cancellation` is triggered.
+    ///
+    /// When `has_icy_metadata` is true (MP3 listener that sent
+    /// `Icy-MetaData: 1` and was answered with `icy-metaint`), exactly
+    /// `metaint` audio bytes are written between in-band metadata blocks;
+    /// the metadata frames themselves do not count toward the interval.
     #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
@@ -106,7 +111,15 @@ pub trait OutputProtocol: Send + Sync + 'static {
         mount_info: Arc<crate::mount::MountInfo>,
         current_title: Arc<arc_swap::ArcSwap<Option<String>>>,
         source_overlay: Arc<arc_swap::ArcSwap<Option<crate::mount::SourceOverlay>>>,
-        icy_requested: bool,
+        /// True when this listener sent `Icy-MetaData: 1` on an MP3 mount and
+        /// the handshake advertised `icy-metaint`; the writer must inject
+        /// in-band metadata blocks into the audio stream.
+        has_icy_metadata: bool,
+        /// Per-connection tracker holding the metadata payload last injected
+        /// on this connection (`None` at connect time). Used for change
+        /// detection so unchanged titles emit a zero-length block. Owned by
+        /// the caller's writer loop — never shared across listeners.
+        last_meta_payload: &mut Option<Vec<u8>>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ListenerStats, OutputError>;
 }
