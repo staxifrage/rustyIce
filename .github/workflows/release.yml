@@ -3,18 +3,26 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'The tag name to build from and upload to (e.g., v1.0.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Dynamically use the release tag or the manual input tag
+  RELEASE_TAG: \${{ github.event.release.tag_name || inputs.tag_name }}
 
 jobs:
   # ── Single-file binaries (one per OS/arch) ─────────────────────────────────
   binary:
-    name: binary ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: binary \${{ matrix.name }}
+    runs-on: \${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: \${{ env.RELEASE_TAG }}
 
       # mp3lame-sys builds libmp3lame from source via autotools; aws-lc-rs
       # needs cmake. C compilers are preinstalled on every runner image.
@@ -66,15 +74,15 @@ jobs:
       - name: Add MSYS2 to PATH (windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: echo "C:/msys64/usr/bin" >> "$GITHUB_PATH"
+        run: echo "C:/msys64/usr/bin" >> "\$GITHUB_PATH"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: \${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-\${{ matrix.target }}
 
       # Linux binaries are linked against glibc 2.17 (CentOS/RHEL 7) via
       # cargo-zigbuild so they run on older distros — a plain `cargo build` on
@@ -94,25 +102,25 @@ jobs:
 
       - name: Build (linux, glibc 2.17)
         if: runner.os == 'Linux'
-        run: cargo zigbuild --release --bin rustyice --target ${{ matrix.target }}.2.17
+        run: cargo zigbuild --release --bin rustyice --target \${{ matrix.target }}.2.17
 
       - name: Build (macOS / Windows)
         if: runner.os != 'Linux'
-        run: cargo build --release --bin rustyice --target ${{ matrix.target }}
+        run: cargo build --release --bin rustyice --target \${{ matrix.target }}
 
       - name: Rename + upload binary
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: \${{ github.token }}
         run: |
-          OUT="rustyice-${{ matrix.name }}${{ matrix.ext }}"
-          cp "target/${{ matrix.target }}/release/rustyice${{ matrix.ext }}" "$OUT"
-          gh release upload "${{ github.event.release.tag_name }}" "$OUT" --clobber
+          OUT="rustyice- matrix.name {{ matrix.ext }}"
+          cp "target/\${{ matrix.target }}/release/rustyice matrix.ext " "OUT"
+          gh release upload "\({{ env.RELEASE_TAG }}" "\)OUT" --clobber
 
   # ── .deb and .rpm packages (linux amd64 + arm64) ───────────────────────────
   linux-package:
-    name: package ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: package \${{ matrix.name }}
+    runs-on: \${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -126,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: \${{ env.RELEASE_TAG }}
 
       - name: Install build prereqs
         run: |
@@ -136,11 +144,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: \${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: package-${{ matrix.target }}
+          key: package-\${{ matrix.target }}
 
       - name: Set up zig
         uses: mlugg/setup-zig@v2
@@ -156,18 +164,17 @@ jobs:
       # older distros; cargo-deb/-rpm then package this prebuilt binary
       # (--no-build / target dir is unchanged by the .2.17 glibc suffix).
       - name: Build release binary (glibc 2.17)
-        run: cargo zigbuild --release --bin rustyice --target ${{ matrix.target }}.2.17 -p rustyice-server
+        run: cargo zigbuild --release --bin rustyice --target \${{ matrix.target }}.2.17 -p rustyice-server
 
       - name: Build .deb
-        run: cargo deb -p rustyice-server --no-build --target ${{ matrix.target }}
+        run: cargo deb -p rustyice-server --no-build --target \${{ matrix.target }}
 
       - name: Build .rpm
-        run: cargo generate-rpm -p crates/rustyice-server --target ${{ matrix.target }}
+        run: cargo generate-rpm -p crates/rustyice-server --target \${{ matrix.target }}
 
       - name: Upload .deb and .rpm
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: \${{ github.token }}
         run: |
-          TAG="${{ github.event.release.tag_name }}"
-          gh release upload "$TAG" target/${{ matrix.target }}/debian/*.deb           --clobber
-          gh release upload "$TAG" target/${{ matrix.target }}/generate-rpm/*.rpm     --clobber
+          gh release upload "\({{ env.RELEASE_TAG }}" target/\){{ matrix.target }}/debian/*.deb           --clobber
+          gh release upload "\({{ env.RELEASE_TAG }}" target/\){{ matrix.target }}/generate-rpm/*.rpm     --clobber
