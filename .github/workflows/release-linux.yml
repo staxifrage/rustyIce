@@ -47,7 +47,7 @@ jobs:
       - name: Checkout release
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.release_tag.outputs.tag }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
       - name: Install build prerequisites
         run: |
@@ -102,6 +102,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              --target "${{ github.sha }}"
+          fi
+
           gh release upload \
             "$RELEASE_TAG" \
             "rustyice-linux-${{ matrix.arch }}" \
