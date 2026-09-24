@@ -111,14 +111,7 @@ pub trait OutputProtocol: Send + Sync + 'static {
         mount_info: Arc<crate::mount::MountInfo>,
         current_title: Arc<arc_swap::ArcSwap<Option<String>>>,
         source_overlay: Arc<arc_swap::ArcSwap<Option<crate::mount::SourceOverlay>>>,
-        /// True when this listener sent `Icy-MetaData: 1` on an MP3 mount and
-        /// the handshake advertised `icy-metaint`; the writer must inject
-        /// in-band metadata blocks into the audio stream.
         has_icy_metadata: bool,
-        /// Per-connection tracker holding the metadata payload last injected
-        /// on this connection (`None` at connect time). Used for change
-        /// detection so unchanged titles emit a zero-length block. Owned by
-        /// the caller's writer loop — never shared across listeners.
         last_meta_payload: &mut Option<Vec<u8>>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ListenerStats, OutputError>;
