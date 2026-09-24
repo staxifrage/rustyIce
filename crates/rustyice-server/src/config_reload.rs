@@ -690,6 +690,7 @@ mod tests {
             _: Arc<ArcSwap<Option<String>>>,
             _: Arc<ArcSwap<Option<rustyice_core::mount::SourceOverlay>>>,
             _: bool,
+            _: &mut Option<Vec<u8>>,
             _: CancellationToken,
         ) -> Result<ListenerStats, rustyice_core::error::OutputError> {
             unreachable!("apply_config tests should never trigger output");

@@ -120,6 +120,9 @@ async fn listener_handler(
 
     tokio::spawn(async move {
         let mut writer = writer;
+        // Tracks the last ICY metadata payload sent to this listener so the
+        // output protocol can suppress duplicate in-band metadata frames.
+        let mut last_meta_payload: Option<Vec<u8>> = None;
         // Vorbis listeners joining mid-broadcast need the ident/comment/setup
         // header pages prepended before the live bus stream — without them
         // libvorbis on the client cannot decode any audio packets.  For MP3
@@ -132,7 +135,7 @@ async fn listener_handler(
             }
         }
         match output
-            .run(writer, subscription, mount_info, current_title, source_overlay, has_icy_metadata, cancel_clone)
+            .run(writer, subscription, mount_info, current_title, source_overlay, has_icy_metadata, &mut last_meta_payload, cancel_clone)
             .await
         {
             Ok(listener_stats) => {
